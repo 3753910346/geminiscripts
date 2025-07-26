@@ -175,7 +175,7 @@ retry_with_backoff() {
             fi
             
             attempt=$((attempt + 1))
-        done
+        fi
     done
     
     log "ERROR" "命令在 $max_attempts 次尝试后最终失败"
@@ -1026,10 +1026,8 @@ configure_settings() {
 show_menu() {
     clear
     echo "=========================================="
-    echo "GCP管理器最终版"
-    echo "《本脚本完全免费，禁止任何有关商业行为》"
-    echo "请适量创建，推荐50以内，风险自负"
-    echo "作者1996ddd留言"
+    echo "    密钥管理器最终版《该脚本完全免费，请勿进行任何商业行为》"
+    echo                     "作者《1996》
     echo "=========================================="
     
     # 显示当前状态
@@ -1145,7 +1143,7 @@ if ! check_prerequisites; then
 fi
 
 # 显示欢迎信息
-log "INFO" "GCP 1996ddddd开始发动"
+log "INFO" "1996提醒您密钥管理工具已经启动成功"
 log "INFO" "临时目录: $TEMP_DIR"
 log "INFO" "生成的用户名: $EMAIL_USERNAME"
 
@@ -1153,3 +1151,4 @@ log "INFO" "生成的用户名: $EMAIL_USERNAME"
 while true; do
     show_menu
 done
+    
