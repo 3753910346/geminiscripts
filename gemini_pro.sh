@@ -1,298 +1,539 @@
 #!/bin/bash
 
-# ===== 配置 =====
-# 自动生成随机用户名
+# ===== 极限速率配置 =====
+# 项目配置
+PROJECT_COUNT=50                    # 项目数量（可快速修改）
+MAX_PARALLEL_JOBS=100              # 极限并行数（根据系统调整）
+ULTRA_FAST_MODE=true               # 极速模式开关
+SKIP_CONFIRMATIONS=true            # 跳过确认提示
+
+# 极速优化参数
+MINIMAL_WAIT_TIME=15               # 最小等待时间（秒）
+BURST_SIZE=20                      # 突发请求组大小
+BURST_DELAY=0.5                    # 突发间隔（秒）
+CONNECTION_POOL_SIZE=50            # 连接池大小
+RETRY_AGGRESSIVE=true              # 激进重试模式
+
+# 稳定性保障
+HEALTH_CHECK_INTERVAL=10           # 健康检查间隔
+ERROR_THRESHOLD=0.3                # 错误率阈值（30%）
+CIRCUIT_BREAKER_ENABLED=true       # 熔断器开关
+FALLBACK_ENABLED=true              # 降级机制
+
+# 系统优化
+DISABLE_LOGGING=false              # 禁用详细日志（提升性能）
+MEMORY_OPTIMIZATION=true           # 内存优化
+TEMP_IN_MEMORY=true               # 临时文件内存化
+
+# ===== 动态变量 =====
 TIMESTAMP=$(date +%s)
-RANDOM_CHARS=$(cat /dev/urandom | tr -dc 'a-z0-9' | fold -w 4 | head -n 1)
-EMAIL_USERNAME="momo${RANDOM_CHARS}${TIMESTAMP:(-4)}"
-PROJECT_PREFIX="gemini-key"
-### MODIFICATION ###: Project count is now fixed at 50 as requested.
-TOTAL_PROJECTS=50  # 固定创建50个项目，根据用户要求
-MAX_PARALLEL_JOBS=40  # 默认设置为40 (可根据机器性能和网络调整)
-GLOBAL_WAIT_SECONDS=75 # 创建项目和启用API之间的全局等待时间 (秒)
-MAX_RETRY_ATTEMPTS=3  # 重试次数
-# 只保留纯密钥和逗号分隔密钥文件
-PURE_KEY_FILE="key.txt"
-COMMA_SEPARATED_KEY_FILE="comma_separated_keys_${EMAIL_USERNAME}.txt"
+TEMP_DIR="/dev/shm/gcp_ultra_${TIMESTAMP}"  # 使用内存文件系统
+SESSION_ID=$(echo $TIMESTAMP | md5sum | cut -c1-12)
+PURE_KEY_FILE="gemini_keys_ultra_$(date +%Y%m%d_%H%M%S).txt"
+COMMA_KEY_FILE="gemini_comma_ultra_$(date +%Y%m%d_%H%M%S).txt"
 SECONDS=0
-DELETION_LOG="project_deletion_$(date +%Y%m%d_%H%M%S).log"
-TEMP_DIR="/tmp/gcp_script_${TIMESTAMP}"
-# ===== 配置结束 =====
 
-# ===== 初始化 =====
-mkdir -p "$TEMP_DIR"
-_log_internal() {
-  local level=$1; local msg=$2; local timestamp; timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-  echo "[$timestamp] [$level] $msg"
+# 统计变量
+TOTAL_REQUESTS=0
+SUCCESS_COUNT=0
+ERROR_COUNT=0
+CURRENT_ERROR_RATE=0
+
+# ===== 极速初始化 =====
+init_ultra_fast() {
+    # 优先使用内存文件系统
+    if [ "$TEMP_IN_MEMORY" = true ] && [ -d "/dev/shm" ]; then
+        TEMP_DIR="/dev/shm/gcp_ultra_${TIMESTAMP}"
+    else
+        TEMP_DIR="/tmp/gcp_ultra_${TIMESTAMP}"
+    fi
+    
+    mkdir -p "$TEMP_DIR"
+    
+    # 初始化输出文件
+    > "$PURE_KEY_FILE"
+    > "$COMMA_KEY_FILE"
+    
+    # 设置文件描述符限制
+    ulimit -n 4096 2>/dev/null || true
 }
-_log_internal "INFO" "JSON 解析将仅使用备用方法 (sed/grep)。"
-# ===== 初始化结束 =====
 
-# ===== 工具函数 =====
-log() { _log_internal "$1" "$2"; }
-
-parse_json() {
-  local json="$1"; local field="$2"; local value=""
-  if [ -z "$json" ]; then return 1; fi
-  case "$field" in
-    ".keyString") value=$(echo "$json" | sed -n 's/.*"keyString": *"\([^"]*\)".*/\1/p');;
-    *) local field_name=$(echo "$field" | tr -d '.["]'); value=$(echo "$json" | grep -oP "(?<=\"$field_name\":\s*\")[^\"]*");;
-  esac
-  if [ -n "$value" ]; then echo "$value"; return 0; else return 1; fi
+# ===== 极速日志系统 =====
+ultra_log() {
+    local level=$1
+    local msg=$2
+    
+    if [ "$DISABLE_LOGGING" = true ] && [ "$level" != "ERROR" ] && [ "$level" != "SUCCESS" ]; then
+        return
+    fi
+    
+    local timestamp=$(date '+%H:%M:%S')
+    printf "[%s][%s] %s\n" "$timestamp" "$level" "$msg"
 }
 
-write_keys_to_files() {
+# ===== 极速JSON解析（纯bash实现）=====
+extract_api_key() {
+    local json="$1"
+    # 使用最快的sed方式提取keyString
+    echo "$json" | sed -n 's/.*"keyString"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p'
+}
+
+# ===== 极速文件写入（批量缓存）=====
+declare -a KEY_BUFFER=()
+BUFFER_SIZE=10
+
+write_key_fast() {
     local api_key="$1"
-    if [ -z "$api_key" ]; then return; fi
+    KEY_BUFFER+=("$api_key")
+    
+    # 当缓冲区满时批量写入
+    if [ ${#KEY_BUFFER[@]} -ge $BUFFER_SIZE ]; then
+        flush_key_buffer
+    fi
+}
+
+flush_key_buffer() {
+    if [ ${#KEY_BUFFER[@]} -eq 0 ]; then
+        return
+    fi
+    
     (
         flock 200
-        echo "$api_key" >> "$PURE_KEY_FILE"
-        if [[ -s "$COMMA_SEPARATED_KEY_FILE" ]]; then echo -n "," >> "$COMMA_SEPARATED_KEY_FILE"; fi
-        echo -n "$api_key" >> "$COMMA_SEPARATED_KEY_FILE"
-    ) 200>"${TEMP_DIR}/key_files.lock"
+        for key in "${KEY_BUFFER[@]}"; do
+            echo "$key" >> "$PURE_KEY_FILE"
+            if [ -s "$COMMA_KEY_FILE" ]; then
+                echo -n "," >> "$COMMA_KEY_FILE"
+            fi
+            echo -n "$key" >> "$COMMA_KEY_FILE"
+        done
+    ) 200>"${TEMP_DIR}/keys.lock"
+    
+    KEY_BUFFER=()
 }
 
-retry_with_backoff() {
-  local max_attempts=$1; local cmd=$2; local attempt=1; local timeout=5; local error_log="${TEMP_DIR}/error_$RANDOM.log"
-  while [ $attempt -le $max_attempts ]; do
-    if bash -c "$cmd" 2>"$error_log"; then rm -f "$error_log"; return 0; fi
-    local error_msg=$(cat "$error_log")
-    if [[ "$error_msg" == *"Permission denied"* || "$error_msg" == *"Authentication failed"* ]]; then
-        log "ERROR" "权限或认证错误，停止重试。"; rm -f "$error_log"; return 1;
+# ===== 熔断器机制 =====
+check_circuit_breaker() {
+    if [ "$CIRCUIT_BREAKER_ENABLED" != true ]; then
+        return 0
     fi
-    if [ $attempt -lt $max_attempts ]; then sleep $timeout; timeout=$((timeout * 2)); fi
-    attempt=$((attempt + 1))
-  done
-  log "ERROR" "命令在 $max_attempts 次尝试后最终失败。最后错误: $(cat "$error_log")"; rm -f "$error_log"; return 1
+    
+    if [ $TOTAL_REQUESTS -gt 0 ]; then
+        CURRENT_ERROR_RATE=$(echo "scale=2; $ERROR_COUNT / $TOTAL_REQUESTS" | bc 2>/dev/null || echo "0")
+        
+        if (( $(echo "$CURRENT_ERROR_RATE > $ERROR_THRESHOLD" | bc -l 2>/dev/null || echo "0") )); then
+            ultra_log "WARN" "错误率过高 ($CURRENT_ERROR_RATE)，启动熔断保护"
+            sleep 5
+            return 1
+        fi
+    fi
+    return 0
 }
 
-show_progress() {
-    local completed=$1; local total=$2; if [ $total -le 0 ]; then return; fi
-    if [ $completed -gt $total ]; then completed=$total; fi
-    local percent=$((completed * 100 / total))
-    local completed_chars=$((percent * 50 / 100))
-    local remaining_chars=$((50 - completed_chars))
-    local progress_bar=$(printf "%${completed_chars}s" "" | tr ' ' '#')
-    local remaining_bar=$(printf "%${remaining_chars}s" "")
-    printf "\r[%s%s] %d%% (%d/%d)" "$progress_bar" "$remaining_bar" "$percent" "$completed" "$total"
+# ===== 极速重试机制 =====
+ultra_retry() {
+    local max_attempts=$1
+    local cmd="$2"
+    local attempt=1
+    local delay=1
+    
+    while [ $attempt -le $max_attempts ]; do
+        if eval "$cmd" 2>/dev/null; then
+            return 0
+        fi
+        
+        ((TOTAL_REQUESTS++))
+        ((ERROR_COUNT++))
+        
+        if [ "$RETRY_AGGRESSIVE" = true ]; then
+            # 激进模式：快速重试
+            if [ $attempt -lt $max_attempts ]; then
+                sleep $delay
+                delay=$(echo "$delay * 1.5" | bc 2>/dev/null || echo "2")
+            fi
+        else
+            # 保守模式：指数退避
+            sleep $((delay * attempt))
+        fi
+        
+        ((attempt++))
+        
+        # 检查熔断器
+        if ! check_circuit_breaker; then
+            return 1
+        fi
+    done
+    
+    return 1
 }
 
-generate_report() {
-  local success=$1; local attempted=$2; local success_rate=0
-  if [ "$attempted" -gt 0 ]; then success_rate=$(echo "scale=2; $success * 100 / $attempted" | bc); fi
-  local failed=$((attempted - success)); local duration=$SECONDS; local minutes=$((duration / 60)); local seconds_rem=$((duration % 60))
-  echo ""; echo "========== 执行报告 =========="
-  echo "计划目标: $attempted 个项目"
-  echo "成功获取密钥: $success 个"
-  echo "失败: $failed 个"
-  echo "成功率: $success_rate%"
-  if [ $success -gt 0 ]; then local avg_time=$((duration / success)); echo "平均处理时间 (成功项目): $avg_time 秒/项目"; fi
-  echo "总执行时间: $minutes 分 $seconds_rem 秒"
-  echo "API密钥已保存至:"
-  echo "- 纯API密钥 (每行一个): $PURE_KEY_FILE"
-  echo "- 逗号分隔密钥 (单行): $COMMA_SEPARATED_KEY_FILE"
-  echo "=========================="
+# ===== 极速进度显示 =====
+show_ultra_progress() {
+    local completed=$1
+    local total=$2
+    local stage=$3
+    
+    if [ $((completed % 5)) -eq 0 ] || [ $completed -eq $total ]; then
+        local percent=$((completed * 100 / total))
+        local bar_length=30
+        local filled=$((percent * bar_length / 100))
+        local empty=$((bar_length - filled))
+        
+        local bar=$(printf "%${filled}s" "" | tr ' ' '█')
+        local space=$(printf "%${empty}s" "" | tr ' ' '░')
+        
+        printf "\r%s [%s%s] %d%% (%d/%d) S:%d E:%d" "$stage" "$bar" "$space" "$percent" "$completed" "$total" "$SUCCESS_COUNT" "$ERROR_COUNT"
+    fi
 }
 
-task_create_project() {
-    local project_id="$1"; local success_file="$2"; local error_log="${TEMP_DIR}/create_${project_id}_error.log"
-    if gcloud projects create "$project_id" --name="$project_id" --no-set-as-default --quiet >/dev/null 2>"$error_log"; then
-        (flock 200; echo "$project_id" >> "$success_file";) 200>"${success_file}.lock"
-        rm -f "$error_log"; return 0
+# ===== 极速项目名称生成 =====
+generate_ultra_fast_names() {
+    local count=$1
+    local names=()
+    
+    # 预生成所有名称（避免运行时生成）
+    local prefixes=("app" "api" "dev" "sys" "web" "net" "bot" "ai" "ml" "db")
+    local suffixes=("pro" "hub" "lab" "box" "kit" "core" "zone" "link" "flow" "sync")
+    
+    for i in $(seq 1 $count); do
+        local prefix=${prefixes[$((i % ${#prefixes[@]}))]}
+        local suffix=${suffixes[$(((i + 3) % ${#suffixes[@]}))]}
+        local number=$(printf "%03d" $((i + RANDOM % 100)))
+        local name="${prefix}${suffix}${number}"
+        
+        # 确保符合GCP命名规范
+        name=$(echo "$name" | cut -c1-25)
+        names+=("$name")
+    done
+    
+    printf '%s\n' "${names[@]}"
+}
+
+# ===== 极速任务函数 =====
+ultra_create_project() {
+    local project_id="$1"
+    local success_file="$2"
+    
+    if ultra_retry 2 "gcloud projects create '$project_id' --name='$project_id' --no-set-as-default --quiet"; then
+        echo "$project_id" >> "$success_file"
+        ((SUCCESS_COUNT++))
+        return 0
     else
-        log "ERROR" "创建项目失败: $project_id: $(cat "$error_log")"
-        rm -f "$error_log"; return 1
+        ((ERROR_COUNT++))
+        return 1
     fi
 }
 
-task_enable_api() {
-    local project_id="$1"; local success_file="$2"; local error_log="${TEMP_DIR}/enable_${project_id}_error.log"
-    if retry_with_backoff $MAX_RETRY_ATTEMPTS "gcloud services enable generativelanguage.googleapis.com --project=\"$project_id\" --quiet 2>\"$error_log\""; then
-        (flock 200; echo "$project_id" >> "$success_file";) 200>"${success_file}.lock"
-        rm -f "$error_log"; return 0
+ultra_enable_api() {
+    local project_id="$1"
+    local success_file="$2"
+    
+    if ultra_retry 3 "gcloud services enable generativelanguage.googleapis.com --project='$project_id' --quiet"; then
+        echo "$project_id" >> "$success_file"
+        ((SUCCESS_COUNT++))
+        return 0
     else
-        log "ERROR" "启用API失败: $project_id: $(cat "$error_log")"
-        rm -f "$error_log"; return 1
+        ((ERROR_COUNT++))
+        return 1
     fi
 }
 
-task_create_key() {
-    local project_id="$1"; local error_log="${TEMP_DIR}/key_${project_id}_error.log"; local create_output
-    if ! create_output=$(retry_with_backoff $MAX_RETRY_ATTEMPTS "gcloud services api-keys create --project=\"$project_id\" --display-name=\"Gemini API Key for $project_id\" --format=\"json\" --quiet 2>\"$error_log\""); then
-        log "ERROR" "创建密钥失败: $project_id: $(cat "$error_log")"
-        rm -f "$error_log"; return 1
+ultra_create_key() {
+    local project_id="$1"
+    
+    local output
+    if output=$(ultra_retry 3 "gcloud services api-keys create --project='$project_id' --display-name='Key-$project_id' --format='json' --quiet"); then
+        local api_key=$(extract_api_key "$output")
+        if [ -n "$api_key" ]; then
+            write_key_fast "$api_key"
+            ((SUCCESS_COUNT++))
+            return 0
+        fi
     fi
-    local api_key; api_key=$(parse_json "$create_output" ".keyString")
-    if [ -n "$api_key" ]; then
-        log "SUCCESS" "成功提取密钥: $project_id"
-        write_keys_to_files "$api_key"; rm -f "$error_log"; return 0
-    else
-        log "ERROR" "提取密钥失败: $project_id (无法从gcloud输出解析keyString)"
-        rm -f "$error_log"; return 1
-    fi
+    
+    ((ERROR_COUNT++))
+    return 1
 }
 
-delete_project() {
-  local project_id="$1"; local error_log="${TEMP_DIR}/delete_${project_id}_error.log"
-  if gcloud projects delete "$project_id" --quiet 2>"$error_log"; then
-    log "SUCCESS" "成功删除项目: $project_id"
-    ( flock 201; echo "[$(date '+%Y-%m-%d %H:%M:%S')] 已删除: $project_id" >> "$DELETION_LOG"; ) 201>"${TEMP_DIR}/${DELETION_LOG}.lock"
-    rm -f "$error_log"; return 0
-  else
-    log "ERROR" "删除项目失败: $project_id: $(cat "$error_log")"
-    ( flock 201; echo "[$(date '+%Y-%m-%d %H:%M:%S')] 删除失败: $project_id - $(cat "$error_log")" >> "$DELETION_LOG"; ) 201>"${TEMP_DIR}/${DELETION_LOG}.lock"
-    rm -f "$error_log"; return 1
-  fi
-}
-
-cleanup_resources() {
-  log "INFO" "执行退出清理..."; if [ -d "$TEMP_DIR" ]; then rm -rf "$TEMP_DIR"; fi
-}
-# ===== 工具函数结束 =====
-
-# ===== 功能模块 =====
-run_parallel() {
-    local task_func="$1"; local description="$2"; local success_file="$3"; shift 3; local items=("$@")
-    local total_items=${#items[@]}; if [ $total_items -eq 0 ]; then log "INFO" "在 '$description' 阶段没有项目需要处理。"; return 0; fi
-    local active_jobs=0; local completed_count=0; local success_count=0; local fail_count=0; local pids=()
-    log "INFO" "开始并行执行 '$description' (最多 $MAX_PARALLEL_JOBS 个并行)..."
+# ===== 极速并行执行引擎 =====
+ultra_parallel_execute() {
+    local task_func="$1"
+    local stage_name="$2"
+    local success_file="$3"
+    shift 3
+    local items=("$@")
+    
+    local total=${#items[@]}
+    local completed=0
+    local active_jobs=0
+    local job_pids=()
+    local job_items=()
+    
+    ultra_log "INFO" "🚀 启动极速执行: $stage_name ($total 项目, $MAX_PARALLEL_JOBS 并行)"
+    
+    # 重置计数器
+    SUCCESS_COUNT=0
+    ERROR_COUNT=0
+    
     for item in "${items[@]}"; do
-        "$task_func" "$item" "$success_file" &
-        pids+=($!); ((active_jobs++))
-        if [[ "$active_jobs" -ge "$MAX_PARALLEL_JOBS" ]]; then wait -n; ((active_jobs--)); fi
+        # 控制并发数
+        while [ $active_jobs -ge $MAX_PARALLEL_JOBS ]; do
+            # 检查完成的任务
+            for i in "${!job_pids[@]}"; do
+                local pid=${job_pids[$i]}
+                if ! kill -0 $pid 2>/dev/null; then
+                    wait $pid
+                    ((completed++))
+                    ((active_jobs--))
+                    
+                    show_ultra_progress $completed $total "$stage_name"
+                    
+                    # 清理完成的任务
+                    unset job_pids[$i]
+                    unset job_items[$i]
+                fi
+            done
+            
+            # 重建数组（移除空元素）
+            job_pids=($(printf '%s\n' "${job_pids[@]}" | grep -v '^$'))
+            job_items=($(printf '%s\n' "${job_items[@]}" | grep -v '^$'))
+            
+            # 健康检查
+            if [ $((completed % HEALTH_CHECK_INTERVAL)) -eq 0 ] && [ $completed -gt 0 ]; then
+                if ! check_circuit_breaker; then
+                    ultra_log "ERROR" "熔断器触发，停止执行"
+                    break 2
+                fi
+            fi
+            
+            sleep 0.1
+        done
+        
+        # 启动新任务
+        if [ "$success_file" = "/dev/null" ]; then
+            $task_func "$item" &
+        else
+            $task_func "$item" "$success_file" &
+        fi
+        
+        local pid=$!
+        job_pids+=($pid)
+        job_items+=("$item")
+        ((active_jobs++))
+        
+        # 突发控制
+        if [ $((${#job_pids[@]} % BURST_SIZE)) -eq 0 ]; then
+            sleep $BURST_DELAY
+        fi
     done
-    for pid in "${pids[@]}"; do
-        wait "$pid"; local exit_status=$?; ((completed_count++))
-        if [ $exit_status -eq 0 ]; then ((success_count++)); else ((fail_count++)); fi
-        show_progress $completed_count $total_items; echo -n " $description 中 (S:$success_count F:$fail_count)..."
+    
+    # 等待所有任务完成
+    for pid in "${job_pids[@]}"; do
+        if [ -n "$pid" ]; then
+            wait $pid
+            ((completed++))
+            show_ultra_progress $completed $total "$stage_name"
+        fi
     done
-    echo; log "INFO" "阶段 '$description' 完成。成功: $success_count, 失败: $fail_count"
-    log "INFO" "======================================================"
-    if [ $fail_count -gt 0 ]; then return 1; else return 0; fi
+    
+    echo
+    ultra_log "INFO" "✅ $stage_name 完成: 成功 $SUCCESS_COUNT, 失败 $ERROR_COUNT"
+    
+    return 0
 }
 
-create_projects_and_get_keys_fast() {
-    SECONDS=0
-    log "INFO" "======================================================"
-    log "INFO" "高速模式: 创建固定的 $TOTAL_PROJECTS 个项目并获取API密钥"
-    log "INFO" "======================================================"
-    ### MODIFICATION ###: Quota check is removed.
-    log "INFO" "将使用随机生成的用户名: ${EMAIL_USERNAME}"
-    log "INFO" "脚本将在 3 秒后开始执行..."; sleep 3
-
-    > "$PURE_KEY_FILE"; > "$COMMA_SEPARATED_KEY_FILE"
-    local projects_to_create=()
-    for i in $(seq 1 $TOTAL_PROJECTS); do
-        local project_num=$(printf "%03d" $i)
-        local base_id="${PROJECT_PREFIX}-${EMAIL_USERNAME}-${project_num}"
-        local project_id=$(echo "$base_id" | tr -cd 'a-z0-9-' | cut -c 1-30 | sed 's/-$//')
-        if ! [[ "$project_id" =~ ^[a-z] ]]; then project_id="g${project_id:1}"; project_id=$(echo "$project_id" | cut -c 1-30 | sed 's/-$//'); fi
-        projects_to_create+=("$project_id")
+# ===== 极速主函数 =====
+ultra_fast_execution() {
+    ultra_log "INFO" "🔥🔥🔥 极限速率模式启动 🔥🔥🔥"
+    ultra_log "INFO" "目标: $PROJECT_COUNT 个项目, $MAX_PARALLEL_JOBS 并行"
+    ultra_log "INFO" "预计完成时间: $((PROJECT_COUNT * 3 / MAX_PARALLEL_JOBS + MINIMAL_WAIT_TIME)) 秒"
+    
+    if [ "$SKIP_CONFIRMATIONS" != true ]; then
+        read -p "⚡ 确认启动极速模式? [Y/n]: " confirm
+        if [[ "$confirm" =~ ^[Nn] ]]; then
+            ultra_log "INFO" "操作已取消"
+            return 1
+        fi
+    fi
+    
+    # 生成项目名称
+    ultra_log "INFO" "⚡ 生成项目名称..."
+    local project_names=($(generate_ultra_fast_names $PROJECT_COUNT))
+    
+    # 导出函数供子进程使用
+    export -f ultra_create_project ultra_enable_api ultra_create_key ultra_retry extract_api_key write_key_fast check_circuit_breaker
+    export TEMP_DIR PURE_KEY_FILE COMMA_KEY_FILE RETRY_AGGRESSIVE TOTAL_REQUESTS SUCCESS_COUNT ERROR_COUNT CURRENT_ERROR_RATE ERROR_THRESHOLD CIRCUIT_BREAKER_ENABLED
+    
+    local start_time=$SECONDS
+    
+    # === 阶段 1: 极速创建项目 ===
+    local created_file="${TEMP_DIR}/created.txt"
+    > "$created_file"
+    
+    ultra_parallel_execute ultra_create_project "🏗️ 创建项目" "$created_file" "${project_names[@]}"
+    
+    # 读取成功创建的项目
+    local created_projects=()
+    if [ -f "$created_file" ]; then
+        mapfile -t created_projects < "$created_file"
+    fi
+    
+    if [ ${#created_projects[@]} -eq 0 ]; then
+        ultra_log "ERROR" "❌ 没有项目创建成功，终止执行"
+        return 1
+    fi
+    
+    ultra_log "INFO" "✅ 项目创建完成: ${#created_projects[@]}/${PROJECT_COUNT}"
+    
+    # === 阶段 2: 智能等待 ===
+    ultra_log "INFO" "⏳ 智能等待 $MINIMAL_WAIT_TIME 秒..."
+    local wait_step=$((MINIMAL_WAIT_TIME / 10))
+    for i in $(seq 1 10); do
+        sleep $wait_step
+        printf "\r⏳ 等待中... %d%%" $((i * 10))
     done
-
-    # --- PHASE 1: Create Projects ---
-    local CREATED_PROJECTS_FILE="${TEMP_DIR}/created_projects.txt"; > "$CREATED_PROJECTS_FILE"
-    export -f task_create_project log retry_with_backoff; export TEMP_DIR MAX_RETRY_ATTEMPTS
-    run_parallel task_create_project "阶段1: 创建项目" "$CREATED_PROJECTS_FILE" "${projects_to_create[@]}"
-    local created_project_ids=(); if [ -f "$CREATED_PROJECTS_FILE" ]; then mapfile -t created_project_ids < "$CREATED_PROJECTS_FILE"; fi
-    if [ ${#created_project_ids[@]} -eq 0 ]; then log "ERROR" "项目创建阶段失败，没有任何项目成功创建。中止操作。"; return 1; fi
-
-    # --- PHASE 2: Global Wait ---
-    log "INFO" "阶段2: 全局等待 ${GLOBAL_WAIT_SECONDS} 秒，以便GCP后端同步项目状态..."
-    for ((i=1; i<=${GLOBAL_WAIT_SECONDS}; i++)); do sleep 1; show_progress $i ${GLOBAL_WAIT_SECONDS}; echo -n " 等待中..."; done
-    echo; log "INFO" "等待完成。"; log "INFO" "======================================================"
-
-    # --- PHASE 3: Enable APIs ---
-    local ENABLED_PROJECTS_FILE="${TEMP_DIR}/enabled_projects.txt"; > "$ENABLED_PROJECTS_FILE"
-    export -f task_enable_api log retry_with_backoff; export TEMP_DIR MAX_RETRY_ATTEMPTS
-    run_parallel task_enable_api "阶段3: 启用API" "$ENABLED_PROJECTS_FILE" "${created_project_ids[@]}"
-    local enabled_project_ids=(); if [ -f "$ENABLED_PROJECTS_FILE" ]; then mapfile -t enabled_project_ids < "$ENABLED_PROJECTS_FILE"; fi
-    if [ ${#enabled_project_ids[@]} -eq 0 ]; then log "ERROR" "API启用阶段失败，没有任何项目成功启用API。中止操作。"; generate_report 0 $TOTAL_PROJECTS; return 1; fi
-
-    # --- PHASE 4: Create Keys ---
-    export -f task_create_key log retry_with_backoff parse_json write_keys_to_files; export TEMP_DIR MAX_RETRY_ATTEMPTS PURE_KEY_FILE COMMA_SEPARATED_KEY_FILE
-    run_parallel task_create_key "阶段4: 创建密钥" "/dev/null" "${enabled_project_ids[@]}"
-
-    # --- FINAL REPORT ---
-    local successful_keys=$(wc -l < "$PURE_KEY_FILE" | xargs)
-    generate_report "$successful_keys" "$TOTAL_PROJECTS"
-    log "INFO" "======================================================"
-    log "INFO" "请检查文件 '$PURE_KEY_FILE' 和 '$COMMA_SEPARATED_KEY_FILE' 中的内容"
-    if [ "$successful_keys" -lt "$TOTAL_PROJECTS" ]; then log "WARN" "有 $((TOTAL_PROJECTS - successful_keys)) 个项目未能成功获取密钥，请检查上方日志了解详情。"; fi
-    log "INFO" "提醒：项目需要关联有效的结算账号才能实际使用 API 密钥"
-    log "INFO" "======================================================"
+    echo
+    
+    # === 阶段 3: 极速启用API ===
+    local enabled_file="${TEMP_DIR}/enabled.txt"
+    > "$enabled_file"
+    
+    ultra_parallel_execute ultra_enable_api "🔌 启用API" "$enabled_file" "${created_projects[@]}"
+    
+    # 读取启用API成功的项目
+    local enabled_projects=()
+    if [ -f "$enabled_file" ]; then
+        mapfile -t enabled_projects < "$enabled_file"
+    fi
+    
+    if [ ${#enabled_projects[@]} -eq 0 ]; then
+        ultra_log "ERROR" "❌ 没有API启用成功，终止执行"
+        return 1
+    fi
+    
+    ultra_log "INFO" "✅ API启用完成: ${#enabled_projects[@]}/${#created_projects[@]}"
+    
+    # === 阶段 4: 极速创建密钥 ===
+    ultra_parallel_execute ultra_create_key "🔑 创建密钥" "/dev/null" "${enabled_projects[@]}"
+    
+    # 刷新剩余缓冲区
+    flush_key_buffer
+    
+    # === 最终统计 ===
+    local total_time=$((SECONDS - start_time))
+    local final_keys=0
+    if [ -f "$PURE_KEY_FILE" ]; then
+        final_keys=$(wc -l < "$PURE_KEY_FILE" 2>/dev/null || echo "0")
+    fi
+    
+    echo
+    echo "🎉🎉🎉 极速执行完成 🎉🎉🎉"
+    echo "================================"
+    echo "⏱️  总耗时: $total_time 秒"
+    echo "🎯 目标项目: $PROJECT_COUNT 个"
+    echo "✅ 成功获取: $final_keys 个密钥"
+    echo "📈 成功率: $((final_keys * 100 / PROJECT_COUNT))%"
+    echo "⚡ 平均速度: $(echo "scale=2; $final_keys / $total_time" | bc 2>/dev/null || echo "N/A") 密钥/秒"
+    echo "📁 输出文件:"
+    echo "   - $PURE_KEY_FILE"
+    echo "   - $COMMA_KEY_FILE"
+    echo "================================"
+    
+    if [ $final_keys -lt $PROJECT_COUNT ]; then
+        ultra_log "WARN" "⚠️ 部分项目未成功，可重新运行脚本补齐"
+    fi
 }
 
-delete_all_existing_projects() {
-  SECONDS=0
-  log "INFO" "======================================================"; log "INFO" "功能2: 删除所有现有项目"; log "INFO" "======================================================"
-  log "INFO" "正在获取项目列表..."; local list_error="${TEMP_DIR}/list_projects_error.log"; local ALL_PROJECTS=($(gcloud projects list --format="value(projectId)" --filter="projectId!~^sys-" --quiet 2>"$list_error")); local list_ec=$?; rm -f "$list_error"
-  if [ $list_ec -ne 0 ]; then log "ERROR" "无法获取项目列表: $(cat "$list_error")"; return 1; fi
-  if [ ${#ALL_PROJECTS[@]} -eq 0 ]; then log "INFO" "未找到任何用户项目，无需删除"; return 0; fi
-  local total_to_delete=${#ALL_PROJECTS[@]}
-  log "INFO" "找到 $total_to_delete 个用户项目需要删除";
-  read -p "!!! 危险操作 !!! 确认要删除所有 $total_to_delete 个项目吗？(输入 'DELETE-ALL' 确认): " confirm; if [ "$confirm" != "DELETE-ALL" ]; then log "INFO" "删除操作已取消"; return 1; fi
-  echo "项目删除日志 ($(date +%Y-%m-%d_%H:%M:%S))" > "$DELETION_LOG"; echo "------------------------------------" >> "$DELETION_LOG"
-  export -f delete_project log retry_with_backoff show_progress; export DELETION_LOG TEMP_DIR MAX_PARALLEL_JOBS MAX_RETRY_ATTEMPTS
-  run_parallel delete_project "删除项目" "/dev/null" "${ALL_PROJECTS[@]}"
-  local successful_deletions=$(grep -c "成功删除项目:" "$DELETION_LOG")
-  local failed_deletions=$(grep -c "删除项目失败:" "$DELETION_LOG")
-  local duration=$SECONDS; local minutes=$((duration / 60)); local seconds_rem=$((duration % 60))
-  echo ""; echo "========== 删除报告 =========="; echo "总计尝试删除: $total_to_delete 个项目"; echo "成功删除: $successful_deletions 个项目"; echo "删除失败: $failed_deletions 个项目"; echo "总执行时间: $minutes 分 $seconds_rem 秒"; echo "详细日志已保存至: $DELETION_LOG"; echo "=========================="
+# ===== 快速配置调整 =====
+quick_config() {
+    echo "⚡ 极速配置调整"
+    echo "==============="
+    echo "当前配置:"
+    echo "1. 项目数量: $PROJECT_COUNT"
+    echo "2. 并行任务: $MAX_PARALLEL_JOBS"
+    echo "3. 等待时间: $MINIMAL_WAIT_TIME 秒"
+    echo "4. 极速模式: $ULTRA_FAST_MODE"
+    echo "5. 开始执行"
+    echo "0. 退出"
+    
+    read -p "选择 [0-5]: " choice
+    
+    case $choice in
+        1)
+            read -p "项目数量 (1-200): " new_count
+            if [[ "$new_count" =~ ^[0-9]+$ ]] && [ "$new_count" -ge 1 ] && [ "$new_count" -le 200 ]; then
+                PROJECT_COUNT=$new_count
+            fi
+            ;;
+        2)
+            read -p "并行任务 (20-150): " new_parallel
+            if [[ "$new_parallel" =~ ^[0-9]+$ ]] && [ "$new_parallel" -ge 20 ] && [ "$new_parallel" -le 150 ]; then
+                MAX_PARALLEL_JOBS=$new_parallel
+            fi
+            ;;
+        3)
+            read -p "等待时间 (10-60): " new_wait
+            if [[ "$new_wait" =~ ^[0-9]+$ ]] && [ "$new_wait" -ge 10 ] && [ "$new_wait" -le 60 ]; then
+                MINIMAL_WAIT_TIME=$new_wait
+            fi
+            ;;
+        4)
+            if [ "$ULTRA_FAST_MODE" = true ]; then
+                ULTRA_FAST_MODE=false
+                MAX_PARALLEL_JOBS=50
+                echo "已切换到稳定模式"
+            else
+                ULTRA_FAST_MODE=true
+                MAX_PARALLEL_JOBS=100
+                echo "已切换到极速模式"
+            fi
+            sleep 1
+            ;;
+        5)
+            ultra_fast_execution
+            return
+            ;;
+        0)
+            exit 0
+            ;;
+    esac
+    
+    quick_config
 }
 
-show_menu() {
-  clear
-  echo "======================================================"
-  echo "     GCP Gemini API 密钥懒人管理工具 v3.1 (极限速度版)"
-  echo "======================================================"
-  local current_account; current_account=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | head -n 1); if [ -z "$current_account" ]; then current_account="无法获取"; fi
-  local current_project; current_project=$(gcloud config get-value project 2>/dev/null); if [ -z "$current_project" ]; then current_project="未设置"; fi
-  echo "当前账号: $current_account"; echo "当前项目: $current_project"
-  echo "固定创建数量: $TOTAL_PROJECTS"; echo "并行任务数: $MAX_PARALLEL_JOBS"; echo "全局等待: ${GLOBAL_WAIT_SECONDS}s"
-  echo ""; echo "请选择功能:";
-  echo "1. [极限速度] 一键创建50个项目并获取API密钥"
-  echo "2. 一键删除所有现有项目"
-  echo "3. 修改配置参数"
-  echo "0. 退出"
-  echo "======================================================"
-  read -p "请输入选项 [0-3]: " choice
-
-  case $choice in
-    1) create_projects_and_get_keys_fast ;;
-    2) delete_all_existing_projects ;;
-    3) configure_settings ;;
-    0) log "INFO" "正在退出..."; exit 0 ;;
-    *) echo "无效选项 '$choice'，请重新选择。"; sleep 2 ;;
-  esac
-  if [[ "$choice" =~ ^[1-3]$ ]]; then echo ""; read -p "按回车键返回主菜单..."; fi
-}
-
-configure_settings() {
-  while true; do
-      clear; echo "======================================================"; echo "配置参数"; echo "======================================================"
-      echo "当前设置:";
-      echo "1. 项目前缀 (用于新建项目): $PROJECT_PREFIX"
-      echo "2. 最大并行任务数: $MAX_PARALLEL_JOBS"
-      echo "3. 最大重试次数 (用于API调用): $MAX_RETRY_ATTEMPTS"
-      echo "4. 全局等待时间 (秒): $GLOBAL_WAIT_SECONDS"
-      echo "0. 返回主菜单"
-      echo "======================================================"
-      ### MODIFICATION ###: Menu options renumbered
-      read -p "请选择要修改的设置 [0-4]: " setting_choice
-      case $setting_choice in
-        1) read -p "请输入新的项目前缀 (留空取消): " new_prefix; if [ -n "$new_prefix" ]; then if [[ "$new_prefix" =~ ^[a-z][a-z0-9-]{0,19}$ ]]; then PROJECT_PREFIX="$new_prefix"; fi; fi ;;
-        2) read -p "请输入最大并行任务数 (建议 20-80，留空取消): " new_parallel; if [[ "$new_parallel" =~ ^[1-9][0-9]*$ ]]; then MAX_PARALLEL_JOBS=$new_parallel; fi ;;
-        3) read -p "请输入最大重试次数 (建议 1-5，留空取消): " new_retries; if [[ "$new_retries" =~ ^[1-9][0-9]*$ ]]; then MAX_RETRY_ATTEMPTS=$new_retries; fi ;;
-        4) read -p "请输入新的全局等待时间 (秒, 建议 60-120, 留空取消): " new_wait; if [[ "$new_wait" =~ ^[1-9][0-9]*$ ]]; then GLOBAL_WAIT_SECONDS=$new_wait; fi ;;
-        0) return ;;
-        *) echo "无效选项 '$setting_choice'，请重新选择。"; sleep 2 ;;
-      esac
-  done
+# ===== 清理函数 =====
+cleanup_ultra() {
+    ultra_log "INFO" "🧹 清理临时文件..."
+    if [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR"
+    fi
+    
+    # 刷新剩余缓冲区
+    flush_key_buffer 2>/dev/null || true
 }
 
 # ===== 主程序 =====
-trap cleanup_resources EXIT SIGINT SIGTERM
-log "INFO" "检查 GCP 登录状态..."; if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" >/dev/null; then log "WARN" "无法获取活动账号信息，请尝试登录:"; if ! gcloud auth login; then log "ERROR" "登录失败。"; exit 1; fi; fi; log "INFO" "GCP 账号检查通过。"
-log "INFO" "检查 GCP 项目配置..."; if ! gcloud config get-value project >/dev/null; then log "WARN" "尚未设置默认GCP项目。建议使用 'gcloud config set project YOUR_PROJECT_ID' 设置。"; sleep 3; else log "INFO" "GCP 项目配置检查完成。"; fi
-while true; do show_menu; done
+main() {
+    # 设置清理陷阱
+    trap cleanup_ultra EXIT SIGINT SIGTERM
+    
+    # 初始化
+    init_ultra_fast
+    
+    # GCP认证检查（快速）
+    if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" >/dev/null 2>&1; then
+        ultra_log "ERROR" "❌ 未登录GCP，请先执行: gcloud auth login"
+        exit 1
+    fi
+    
+    echo "🚀🚀🚀 极限速率 Gemini API 密钥获取工具 🚀🚀🚀"
+    echo "=================================================="
+    echo "⚡ 专为极致速度优化，保证稳定性"
+    echo "🎯 当前配置: $PROJECT_COUNT 项目, $MAX_PARALLEL_JOBS 并行"
+    echo "⏱️  预计用时: $((PROJECT_COUNT * 3 / MAX_PARALLEL_JOBS + MINIMAL_WAIT_TIME)) 秒"
+    echo "=================================================="
+    
+    quick_config
+}
+
+# 启动
+main "$@"
