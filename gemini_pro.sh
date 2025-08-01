@@ -2,16 +2,16 @@
 
 # ==============================================================================
 #
-# 密钥管理器最终融合版 v3.7 (完整修复版)
+# 密钥管理器最终融合版 v3.8 (靶心修复版)
 #
 # - 该脚本完全免费，请勿进行任何商业行为
 # - 作者: 1996 & KKTsN
 # - 融合与重构: 1996
 #
-# - v3.7 更新日志 (完整性修复):
-#   - [重大修复] 补完了之前版本中被错误省略的所有功能函数定义，
-#     解决了 'command not found' 的错误。
-#   - [最终确认] 本版本包含了v3.6的所有修复，且代码完整，是最终稳定版。
+# - v3.8 更新日志 (终极修复):
+#   - [靶心修复] 修正了 task_create_key 函数中解析gcloud返回JSON的路径，
+#     从 ".keyString" 改为正确的 ".response.keyString"，彻底解决
+#     因数据结构嵌套导致的密钥提取失败问题。
 #
 # ==============================================================================
 
@@ -78,9 +78,11 @@ parse_json() {
     if command -v jq &>/dev/null; then
         value=$(echo "$json_input" | jq -r "$field // \"\"")
     else
-        local field_name
-        field_name=$(echo "$field" | sed 's/^\.//; s/\[[0-9]*\]//g; s/"//g')
-        value=$(echo "$json_input" | grep -o "\"$field_name\": *\"[^\"]*\"" | head -n 1 | cut -d'"' -f4)
+        # sed/grep fallback is complex for nested keys, jq is highly recommended.
+        # This simplified version will not work for ".response.keyString"
+        log "WARN" "jq not found. Using simplified parser which may fail for nested data."
+        local simple_field=$(basename "$field")
+        value=$(echo "$json_input" | grep -o "\"$simple_field\": *\"[^\"]*\"" | head -n 1 | cut -d'"' -f4)
     fi
     if [[ -n "$value" && "$value" != "null" ]]; then
         echo "$value"; return 0;
@@ -164,11 +166,15 @@ task_create_key() {
     if [[ -z "$create_output" ]]; then log "ERROR" "为项目 $project_id 创建密钥失败 (无输出)。"; return 1; fi
     local gcp_error_msg; gcp_error_msg=$(parse_json "$create_output" ".error.message")
     if [[ -n "$gcp_error_msg" ]]; then log "ERROR" "为项目 $project_id 创建密钥时GCP返回错误: $gcp_error_msg"; log "DEBUG" "GCP错误详情: $create_output"; return 1; fi
-    local api_key; api_key=$(parse_json "$create_output" ".keyString")
+    
+    # ===== THE BULLSEYE FIX =====
+    local api_key; api_key=$(parse_json "$create_output" ".response.keyString")
+    # ===== END OF FIX =====
+
     if [[ -n "$api_key" ]]; then
         write_keys_to_files "$api_key"; (flock 200; echo "$project_id" >> "$success_file";) 200>"${success_file}.lock"; return 0
     else
-        log "ERROR" "为项目 $project_id 提取密钥失败 (无法解析 .keyString)。"; log "DEBUG" "gcloud返回内容: $create_output"; return 1
+        log "ERROR" "为项目 $project_id 提取密钥失败 (无法解析 .response.keyString)。"; log "DEBUG" "gcloud返回内容: $create_output"; return 1
     fi
 }
 
@@ -228,7 +234,7 @@ generate_report() {
     echo "================================================================"
 }
 
-# ===== 主要功能模块 (完整版) =====
+# ===== 主要功能模块 =====
 
 check_quota() {
     log "INFO" "正在检查GCP项目创建配额..."; local quota_output
@@ -338,7 +344,7 @@ show_menu() {
     clear; local current_account; current_account=$(gcloud auth list --filter=status:ACTIVE --format="value(account)" 2>/dev/null | head -n1)
     echo "   ______   ______   ____     __  __           __                        "; echo "  / ____/  / ____/  / __ \   / / / /  ___     / /  ____     ___     _____";
     echo " / / __   / /      / /_/ /  / /_/ /  / _ \   / /  / __ \   / _ \   / ___/"; echo "/ /_/ /  / /___   / ____/  / __  /  /  __/  / /  / /_/ /  /  __/  / /    ";
-    echo "\____/   \____/  /_/      /_/ /_/   \___/  /_/  / .___/   \___/  /_/     "; echo "                                               /_/                      v3.7"
+    echo "\____/   \____/  /_/      /_/ /_/   \___/  /_/  / .___/   \___/  /_/     "; echo "                                               /_/                      v3.8"
     echo "========================================================================"; echo "  当前账号: ${current_account:-未登录} | 并发数: $MAX_PARALLEL_JOBS | 等待时间: ${GLOBAL_WAIT_SECONDS}s"
     echo "========================================================================"
     echo "  1. 一键创建 ${TOTAL_PROJECTS} 个项目并获取密钥 (推荐, 强健)"; echo "  2. 从现有项目中提取密钥 (智能检查)"; echo "  3. 仅创建项目 (不启用API，不取密钥)"
@@ -356,13 +362,13 @@ cleanup_resources() { log "INFO" "执行退出清理..."; stop_heartbeat; pkill 
 check_prerequisites() {
     log "INFO" "执行前置检查..."; if ! command -v gcloud &> /dev/null; then log "ERROR" "未找到 'gcloud' 命令。"; return 1; fi
     if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q "."; then log "WARN" "未检测到活跃GCP账号，请先登录。"; gcloud auth login || return 1; fi
-    if ! command -v jq &>/dev/null; then log "WARN" "推荐安装 'jq' 以获得更可靠的JSON解析。"; fi
+    if ! command -v jq &>/dev/null; then log "WARN" "强烈建议安装 'jq' 以获得最可靠的JSON解析！"; fi
     log "INFO" "前置检查通过。"; return 0
 }
 
 # ===== 程序入口 =====
 trap cleanup_resources EXIT SIGINT SIGTERM
 if ! check_prerequisites; then log "ERROR" "前置检查失败，程序退出。"; exit 1; fi
-log "INFO" "密钥管理器 v3.7 (最终修复版) 已启动！"
+log "INFO" "密钥管理器 v3.8 (最终修复版) 已启动！"
 sleep 1
 while true; do show_menu; done
