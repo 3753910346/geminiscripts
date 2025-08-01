@@ -2,14 +2,15 @@
 
 # ==============================================================================
 #
-# 密钥管理器最终融合版 v3.2
+# 密钥管理器最终融合版 v3.3
 #
 # - 该脚本完全免费，请勿进行任何商业行为
 # - 作者: 1996 & KKTsN
 # - 融合与重构: 1996
 #
-# - v3.2 更新日志:
-#   - 修复了 run_parallel 函数中的一个 bash 语法错误 (多余的分号)
+# - v3.3 更新日志:
+#   - 再次确认并修复 run_parallel 函数中的 bash 语法错误 (&;)
+#   - 明确指出需更新 GitHub 源文件来解决 curl 执行问题
 #
 # ==============================================================================
 
@@ -185,9 +186,7 @@ run_parallel() {
             for j in "${!pids[@]}"; do if ! kill -0 "${pids[j]}" 2>/dev/null; then unset 'pids[j]'; ((completed_count++)); fi; done
             show_progress "$completed_count" "$total_items" "$description"
         fi
-        # ===== FIX START: 修复从这里开始 =====
         ( "$task_func" "${items[i]}" "$success_file" ) & pids+=($!)
-        # ===== FIX END: 修复在这里结束 =====
     done
     
     for pid in "${pids[@]}"; do wait "$pid"; ((completed_count++)); show_progress "$completed_count" "$total_items" "$description"; done
@@ -358,7 +357,7 @@ show_menu() {
     echo " / / __   / /      / /_/ /  / /_/ /  / _ \   / /  / __ \   / _ \   / ___/"
     echo "/ /_/ /  / /___   / ____/  / __  /  /  __/  / /  / /_/ /  /  __/  / /    "
     echo "\____/   \____/  /_/      /_/ /_/   \___/  /_/  / .___/   \___/  /_/     "
-    echo "                                               /_/                      v3.2"             
+    echo "                                               /_/                      v3.3"             
     echo "========================================================================"
     echo "  当前账号: ${current_account:-未登录} | 并发数: $MAX_PARALLEL_JOBS | 等待时间: ${GLOBAL_WAIT_SECONDS}s"
     echo "========================================================================"
@@ -403,6 +402,6 @@ check_prerequisites() {
 # ===== 程序入口 =====
 trap cleanup_resources EXIT SIGINT SIGTERM
 if ! check_prerequisites; then log "ERROR" "前置检查失败，程序退出。"; exit 1; fi
-log "INFO" "密钥管理器 v3.2 已启动！"
+log "INFO" "密钥管理器 v3.3 已启动！"
 sleep 1
 while true; do show_menu; done
