@@ -2,16 +2,14 @@
 
 # ==============================================================================
 #
-# 密钥管理器最终融合版 v3.1
+# 密钥管理器最终融合版 v3.2
 #
 # - 该脚本完全免费，请勿进行任何商业行为
 # - 作者: 1996 & KKTsN
 # - 融合与重构: 1996
 #
-# - v3.1 更新日志:
-#   - 实现了完整的配置修改菜单 (功能6)
-#   - 补完了清理项目中所有API密钥的功能 (功能5)
-#   - 优化了代码结构，所有功能均已可用
+# - v3.2 更新日志:
+#   - 修复了 run_parallel 函数中的一个 bash 语法错误 (多余的分号)
 #
 # ==============================================================================
 
@@ -187,7 +185,9 @@ run_parallel() {
             for j in "${!pids[@]}"; do if ! kill -0 "${pids[j]}" 2>/dev/null; then unset 'pids[j]'; ((completed_count++)); fi; done
             show_progress "$completed_count" "$total_items" "$description"
         fi
-        ( "$task_func" "${items[i]}" "$success_file" ) &; pids+=($!)
+        # ===== FIX START: 修复从这里开始 =====
+        ( "$task_func" "${items[i]}" "$success_file" ) & pids+=($!)
+        # ===== FIX END: 修复在这里结束 =====
     done
     
     for pid in "${pids[@]}"; do wait "$pid"; ((completed_count++)); show_progress "$completed_count" "$total_items" "$description"; done
@@ -338,14 +338,15 @@ configure_settings() {
         echo "================================================================"
         read -p "选择要修改的设置 [0-5]: " choice
         case $choice in
-            1) read -p "输入新的项目数量 (1-200): " val; if [[ "$val" =~ ^[1-9][0-9]*$ && "$val" -le 200 ]]; then TOTAL_PROJECTS=$val; fi;;
-            2) read -p "输入新的项目前缀 (小写字母开头,含小写字母/数字/-): " val; if [[ "$val" =~ ^[a-z][a-z0-9-]{0,20}$ ]]; then PROJECT_PREFIX="$val"; fi;;
-            3) read -p "输入最大并发数 (5-50): " val; if [[ "$val" =~ ^[0-9]+$ && "$val" -ge 5 && "$val" -le 50 ]]; then MAX_PARALLEL_JOBS=$val; fi;;
-            4) read -p "输入全局等待时间 (建议60-120秒): " val; if [[ "$val" =~ ^[0-9]+$ && "$val" -ge 30 ]]; then GLOBAL_WAIT_SECONDS=$val; fi;;
-            5) read -p "输入最大重试次数 (1-5): " val; if [[ "$val" =~ ^[1-5]$ ]]; then MAX_RETRY_ATTEMPTS=$val; fi;;
+            1) read -p "输入新的项目数量 (1-200): " val; if [[ "$val" =~ ^[1-9][0-9]*$ && "$val" -le 200 ]]; then TOTAL_PROJECTS=$val; log "INFO" "项目数量已更新为: $TOTAL_PROJECTS"; fi;;
+            2) read -p "输入新的项目前缀 (小写字母开头,含字母/数字/-): " val; if [[ "$val" =~ ^[a-z][a-z0-9-]{0,20}$ ]]; then PROJECT_PREFIX="$val"; log "INFO" "项目前缀已更新为: $PROJECT_PREFIX"; fi;;
+            3) read -p "输入最大并发数 (5-50): " val; if [[ "$val" =~ ^[0-9]+$ && "$val" -ge 5 && "$val" -le 50 ]]; then MAX_PARALLEL_JOBS=$val; log "INFO" "最大并发数已更新为: $MAX_PARALLEL_JOBS"; fi;;
+            4) read -p "输入全局等待时间 (建议60-120秒): " val; if [[ "$val" =~ ^[0-9]+$ && "$val" -ge 30 ]]; then GLOBAL_WAIT_SECONDS=$val; log "INFO" "全局等待时间已更新为: $GLOBAL_WAIT_SECONDS"; fi;;
+            5) read -p "输入最大重试次数 (1-5): " val; if [[ "$val" =~ ^[1-5]$ ]]; then MAX_RETRY_ATTEMPTS=$val; log "INFO" "最大重试次数已更新为: $MAX_RETRY_ATTEMPTS"; fi;;
             0) return;;
             *) echo "无效选项。" && sleep 1;;
         esac
+        sleep 1
     done
 }
 
@@ -357,7 +358,7 @@ show_menu() {
     echo " / / __   / /      / /_/ /  / /_/ /  / _ \   / /  / __ \   / _ \   / ___/"
     echo "/ /_/ /  / /___   / ____/  / __  /  /  __/  / /  / /_/ /  /  __/  / /    "
     echo "\____/   \____/  /_/      /_/ /_/   \___/  /_/  / .___/   \___/  /_/     "
-    echo "                                               /_/                      v3.1"             
+    echo "                                               /_/                      v3.2"             
     echo "========================================================================"
     echo "  当前账号: ${current_account:-未登录} | 并发数: $MAX_PARALLEL_JOBS | 等待时间: ${GLOBAL_WAIT_SECONDS}s"
     echo "========================================================================"
@@ -402,6 +403,6 @@ check_prerequisites() {
 # ===== 程序入口 =====
 trap cleanup_resources EXIT SIGINT SIGTERM
 if ! check_prerequisites; then log "ERROR" "前置检查失败，程序退出。"; exit 1; fi
-log "INFO" "密钥管理器 v3.1 已启动！"
+log "INFO" "密钥管理器 v3.2 已启动！"
 sleep 1
 while true; do show_menu; done
